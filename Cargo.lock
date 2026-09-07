@@ -450,6 +450,7 @@ version = "0.14.0"
 dependencies = [
  "eldenring",
  "fromsoftware-shared",
+ "hudhook",
  "rand",
  "serde",
  "toml",

@@ -22,24 +22,26 @@ pub struct EnemySpeedRandomizer {
     toggle_was_pressed: bool,
     last_input_check: Instant,
     channel: SpeedChannelState,
-    uses_first_pool: bool,
-    current_pool_bounds: (u32, u32),
     modified_any_enemy: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SpeedStatus {
     pub enabled: bool,
     pub speed_enabled: bool,
     pub multiplier: f32,
+    pub next_multiplier: Option<f32>,
     pub countdown_ms: Option<u64>,
     pub individual_enemy_speed: bool,
 }
 
 struct SpeedChannelState {
     target_percent: Option<u32>,
+    next_target_percent: Option<u32>,
     enemy_targets: HashMap<usize, u32>,
+    current_pool_bounds: (u32, u32),
     last_randomized: Instant,
+    next_interval_ms: u64,
     has_randomized: bool,
 }
 
@@ -51,8 +53,6 @@ impl EnemySpeedRandomizer {
             toggle_was_pressed: false,
             last_input_check: Instant::now() - input_check_interval,
             channel: SpeedChannelState::new(),
-            uses_first_pool: true,
-            current_pool_bounds: pool_1_bounds(config),
             modified_any_enemy: false,
         }
     }
@@ -62,21 +62,13 @@ impl EnemySpeedRandomizer {
 
         if self.enabled && self.config.enable {
             if self.config.randomize_each_enemy {
-                if self
-                    .channel
-                    .should_randomize(self.config.randomize_interval_ms)
-                {
+                if self.channel.should_randomize() {
                     self.randomize_enemy_targets();
                 }
                 self.apply_individual_enemy_speed();
             } else {
-                if self
-                    .channel
-                    .should_randomize(self.config.randomize_interval_ms)
-                {
-                    let (min_percent, max_percent) = self.next_pool_bounds();
-                    let percent = random_percentage(min_percent, max_percent, &mut rand::rng());
-                    self.channel.set_target(percent);
+                if self.channel.should_randomize() {
+                    self.randomize_shared_speed();
                 }
                 self.apply_shared_speed();
             }
@@ -95,10 +87,20 @@ impl EnemySpeedRandomizer {
             } else {
                 1.0
             },
-            countdown_ms: speed_enabled
-                .then(|| self.channel.countdown_ms(self.config.randomize_interval_ms)),
+            next_multiplier: if speed_enabled && !self.config.randomize_each_enemy {
+                self.channel.next_multiplier()
+            } else {
+                None
+            },
+            countdown_ms: speed_enabled.then(|| self.channel.countdown_ms()),
             individual_enemy_speed: self.config.randomize_each_enemy,
         }
+    }
+
+    pub fn disable(&mut self) {
+        self.enabled = false;
+        self.restore_speed();
+        self.channel.clear_targets();
     }
 
     pub fn update_config(&mut self, config: &EnemySpeedConfig) {
@@ -108,8 +110,6 @@ impl EnemySpeedRandomizer {
         self.config = config.clone();
         self.toggle_was_pressed = false;
         self.channel.clear_targets();
-        self.uses_first_pool = true;
-        self.current_pool_bounds = pool_1_bounds(config);
     }
 
     fn update_toggle_state(&mut self, input_check_interval: Duration) {
@@ -122,35 +122,35 @@ impl EnemySpeedRandomizer {
         if pressed && !self.toggle_was_pressed {
             self.enabled = !self.enabled;
             self.channel.clear_targets();
-            self.uses_first_pool = true;
-            self.current_pool_bounds = pool_1_bounds(&self.config);
             beep_toggle(self.enabled);
         }
         self.toggle_was_pressed = pressed;
     }
 
-    fn next_pool_bounds(&mut self) -> (u32, u32) {
-        let bounds = if self.uses_first_pool {
-            pool_1_bounds(&self.config)
-        } else {
-            pool_2_bounds(&self.config)
-        };
-        self.uses_first_pool = !self.uses_first_pool;
-        self.current_pool_bounds = bounds;
-        bounds
+    fn randomize_shared_speed(&mut self) {
+        let mut rng = rand::rng();
+        let current_percent = self
+            .channel
+            .take_next_target()
+            .unwrap_or_else(|| random_speed_percent(&self.config, &mut rng));
+        let next_percent = random_speed_percent(&self.config, &mut rng);
+        let interval_ms = random_interval_ms(&self.config, &mut rng);
+        self.channel
+            .set_target(current_percent, Some(next_percent), interval_ms);
     }
 
     fn randomize_enemy_targets(&mut self) {
         let Some(enemy_addresses) = current_enemy_addresses() else {
             return;
         };
-        let bounds = self.next_pool_bounds();
         let mut rng = rand::rng();
+        let bounds = weighted_pool_bounds(&self.config, &mut rng);
         let targets = enemy_addresses
             .into_iter()
             .map(|address| (address, random_percentage(bounds.0, bounds.1, &mut rng)))
             .collect();
-        self.channel.set_enemy_targets(targets);
+        let interval_ms = random_interval_ms(&self.config, &mut rng);
+        self.channel.set_enemy_targets(targets, bounds, interval_ms);
     }
 
     fn apply_shared_speed(&mut self) {
@@ -184,7 +184,7 @@ impl EnemySpeedRandomizer {
             return;
         };
         let mut rng = rand::rng();
-        let bounds = self.current_pool_bounds;
+        let bounds = self.channel.current_pool_bounds;
         let mut modified_any_enemy = false;
 
         for chr_set in world_chr_man.chr_sets.iter().flatten() {
@@ -240,33 +240,51 @@ impl SpeedChannelState {
     fn new() -> Self {
         Self {
             target_percent: None,
+            next_target_percent: None,
             enemy_targets: HashMap::new(),
+            current_pool_bounds: (100, 100),
             last_randomized: Instant::now(),
+            next_interval_ms: 1,
             has_randomized: false,
         }
     }
 
-    fn should_randomize(&self, interval_ms: u64) -> bool {
+    fn should_randomize(&self) -> bool {
         !self.has_randomized
-            || self.last_randomized.elapsed() >= Duration::from_millis(interval_ms.max(1))
+            || self.last_randomized.elapsed() >= Duration::from_millis(self.next_interval_ms.max(1))
     }
 
-    fn set_target(&mut self, percent: u32) {
+    fn take_next_target(&mut self) -> Option<u32> {
+        self.next_target_percent.take()
+    }
+
+    fn set_target(&mut self, percent: u32, next_percent: Option<u32>, interval_ms: u64) {
         self.target_percent = Some(percent);
+        self.next_target_percent = next_percent;
         self.enemy_targets.clear();
         self.last_randomized = Instant::now();
+        self.next_interval_ms = interval_ms.max(1);
         self.has_randomized = true;
     }
 
-    fn set_enemy_targets(&mut self, targets: HashMap<usize, u32>) {
+    fn set_enemy_targets(
+        &mut self,
+        targets: HashMap<usize, u32>,
+        bounds: (u32, u32),
+        interval_ms: u64,
+    ) {
         self.target_percent = None;
+        self.next_target_percent = None;
         self.enemy_targets = targets;
+        self.current_pool_bounds = bounds;
         self.last_randomized = Instant::now();
+        self.next_interval_ms = interval_ms.max(1);
         self.has_randomized = true;
     }
 
     fn clear_targets(&mut self) {
         self.target_percent = None;
+        self.next_target_percent = None;
         self.enemy_targets.clear();
         self.has_randomized = false;
     }
@@ -277,8 +295,12 @@ impl SpeedChannelState {
             .unwrap_or(1.0)
     }
 
-    fn countdown_ms(&self, interval_ms: u64) -> u64 {
-        interval_ms
+    fn next_multiplier(&self) -> Option<f32> {
+        self.next_target_percent.map(percentage_to_multiplier)
+    }
+
+    fn countdown_ms(&self) -> u64 {
+        self.next_interval_ms
             .max(1)
             .saturating_sub(self.last_randomized.elapsed().as_millis() as u64)
     }
@@ -306,6 +328,43 @@ fn pool_1_bounds(config: &EnemySpeedConfig) -> (u32, u32) {
 
 fn pool_2_bounds(config: &EnemySpeedConfig) -> (u32, u32) {
     (config.pool_2_min_percent, config.pool_2_max_percent)
+}
+
+fn weighted_pool_bounds(config: &EnemySpeedConfig, rng: &mut impl Rng) -> (u32, u32) {
+    let pool_1_weight = config.pool_1_weight as u64;
+    let pool_2_weight = config.pool_2_weight as u64;
+    let total_weight = pool_1_weight.saturating_add(pool_2_weight);
+
+    if total_weight == 0 {
+        return pool_1_bounds(config);
+    }
+
+    let roll = rng.random_range(0..total_weight);
+    if roll < pool_1_weight {
+        pool_1_bounds(config)
+    } else {
+        pool_2_bounds(config)
+    }
+}
+
+fn random_speed_percent(config: &EnemySpeedConfig, rng: &mut impl Rng) -> u32 {
+    let bounds = weighted_pool_bounds(config, rng);
+    random_percentage(bounds.0, bounds.1, rng)
+}
+
+fn random_interval_ms(config: &EnemySpeedConfig, rng: &mut impl Rng) -> u64 {
+    let (min_ms, max_ms) = if config.randomize_interval_min_ms <= config.randomize_interval_max_ms {
+        (
+            config.randomize_interval_min_ms,
+            config.randomize_interval_max_ms,
+        )
+    } else {
+        (
+            config.randomize_interval_max_ms,
+            config.randomize_interval_min_ms,
+        )
+    };
+    rng.random_range(min_ms.max(1)..=max_ms.max(1))
 }
 
 fn is_enemy(chr_type: ChrType) -> bool {
@@ -346,24 +405,42 @@ mod tests {
     }
 
     #[test]
-    fn pools_alternate() {
+    fn zero_weight_falls_back_to_pool_one() {
         let mut config = EnemySpeedConfig::default();
         config.pool_1_min_percent = 1;
         config.pool_1_max_percent = 99;
         config.pool_2_min_percent = 150;
         config.pool_2_max_percent = 200;
-        let mut randomizer = EnemySpeedRandomizer::new(&config, Duration::from_millis(500));
+        config.pool_1_weight = 0;
+        config.pool_2_weight = 0;
+        let mut rng = rand::rng();
 
-        assert_eq!(randomizer.next_pool_bounds(), (1, 99));
-        assert_eq!(randomizer.next_pool_bounds(), (150, 200));
-        assert_eq!(randomizer.next_pool_bounds(), (1, 99));
+        assert_eq!(weighted_pool_bounds(&config, &mut rng), (1, 99));
+
+        config.pool_1_weight = 100;
+        config.pool_2_weight = 0;
+        assert_eq!(weighted_pool_bounds(&config, &mut rng), (1, 99));
+
+        config.pool_1_weight = 0;
+        config.pool_2_weight = 100;
+        assert_eq!(weighted_pool_bounds(&config, &mut rng), (150, 200));
+    }
+
+    #[test]
+    fn fixed_interval_stays_at_the_configured_value() {
+        let mut config = EnemySpeedConfig::default();
+        config.randomize_interval_min_ms = 1_234;
+        config.randomize_interval_max_ms = 1_234;
+        let mut rng = rand::rng();
+
+        assert_eq!(random_interval_ms(&config, &mut rng), 1_234);
     }
 
     #[test]
     fn individual_mode_keeps_a_separate_target_for_each_enemy() {
         let mut channel = SpeedChannelState::new();
         let targets = HashMap::from([(1, 50), (2, 150)]);
-        channel.set_enemy_targets(targets);
+        channel.set_enemy_targets(targets, (50, 150), 1_234);
 
         assert_eq!(channel.enemy_targets.get(&1), Some(&50));
         assert_eq!(channel.enemy_targets.get(&2), Some(&150));
